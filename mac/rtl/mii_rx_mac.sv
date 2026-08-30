@@ -95,7 +95,7 @@ module mii_rx_mac (
     logic [31:0] crc; 
     logic [3:0][7:0] shft_reg;
 
-    always_ff @(posedge i_rx_clk or negedge i_n_reset) begin
+    always_ff @(posedge i_rx_clk or negedge i_n_reset) begin 
         if (!i_n_reset) begin
             state        <= RX_IDLE;
             crc          <= '1;
