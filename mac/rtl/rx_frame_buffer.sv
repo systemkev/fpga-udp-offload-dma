@@ -27,9 +27,6 @@ module rx_frame_buffer (
     logic [7:0] ping_pong_buf_0 [0:2047];
     logic [7:0] ping_pong_buf_1 [0:2047];
 
-    logic buf_0_used;
-    logic buf_1_used;
-
     logic [10:0] wr_ptr;         // pointer to track writing process
     logic [10:0] wr_ptr_reg_0;   // latched pointer for CDC (buf 0)
     logic [10:0] wr_ptr_reg_1;   // latched pointer for CDC (buf 1)
@@ -37,52 +34,83 @@ module rx_frame_buffer (
     logic wr_buf_0_full; // 1 => buffer 0 is full and valid, and thus can be read 
     logic wr_buf_1_full; // 1 => buffer 1 is full and valid, and thus can be read
 
-    logic [10:0] rd_ptr;
-
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         WR_READY,
         WR_WRITE, 
-        WR_WAIT
+        WR_WAIT,
+        WR_DROP
     } t_writer_fsm;
 
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         RD_READY,
         RD_READ,
-        RD_WAIT
+        RD_WAIT,
+        RD_CDC_ACK
     } t_reader_fsm;
 
     t_writer_fsm wr_state;
     t_reader_fsm rd_state;
 
+    logic frame_bad_during_last;
+    logic frame_good_during_last;
+
     always_ff @(posedge i_rx_clk or negedge i_rx_n_reset) begin : writer 
         if (!i_rx_n_reset) begin
+            wr_state              <= WR_READY;
+            wr_ptr                <= '0;
+            wr_ptr_reg_0          <= '0;
+            wr_ptr_reg_1          <= '0;
+            wr_buf_sel            <= 1'b0;
 
+            wr_buf_0_full         <= 1'b0;
+            wr_buf_1_full         <= 1'b0;
+
+            frame_bad_during_last <= 1'b0;
+            frame_good_during_last<= 1'b0;
+
+            o_buf_ovf             <= 1'b0;
         end else begin 
             o_buf_ovf <= 1'b0;
 
-            if (wr_buf_0_sent) begin 
-                wr_buf_0_full <= 1'b0;
-            end else if (wr_buf_1_sent) begin 
-                wr_buf_1_full <= 1'b0;
-            end 
+            // CDC handshaking with the reader module
+            if (wr_buf_0_full && wr_buf_0_sent)
+                wr_buf_0_full  <= 1'b0;
+            
+            if (wr_buf_1_full && wr_buf_1_sent)
+                wr_buf_1_full  <= 1'b0;
 
             case (wr_state)
 
                 WR_READY : begin 
                     if (i_rx_valid) begin 
-                        wr_ptr   <= 11'b1;
+                        wr_ptr   <= 11'b0;
                         wr_state <= WR_WRITE;
 
-                        if (!buf_0_used) begin 
-                            wr_buf_sel <= 1'b0;
-                            ping_pong_buf_0[0] <= i_rx_data;
-                        end else if (!buf_1_used) begin 
-                            wr_buf_sel <= 1'b1;
-                            ping_pong_buf_1[0] <= i_rx_data;
+                        frame_bad_during_last  <= 1'b0;
+                        frame_good_during_last <= 1'b0;
+
+                        if (!wr_buf_0_full && !wr_buf_0_sent) begin 
+                            wr_ptr             <= 1'b1;
+                            wr_buf_sel         <= 1'b0;
+
+                            if (!i_rx_last) begin 
+                                ping_pong_buf_0[0] <= i_rx_data;
+                            end else begin 
+                                wr_state <= WR_DROP;
+                            end 
+                        end else if (!wr_buf_1_full && !wr_buf_1_sent) begin 
+                            wr_ptr             <= 1'b1;
+                            wr_buf_sel         <= 1'b1;
+
+                            if (!i_rx_last) begin 
+                                ping_pong_buf_1[0] <= i_rx_data;
+                            end else begin 
+                                wr_state <= WR_DROP;
+                            end 
                         end else begin 
                             wr_ptr    <= 11'b0;
                             o_buf_ovf <= 1'b1;
-                            wr_state  <= WR_READY;
+                            wr_state  <= WR_DROP;
                         end 
                     end 
                 end 
@@ -90,6 +118,12 @@ module rx_frame_buffer (
                 WR_WRITE : begin 
                     if (i_rx_valid) begin 
                         wr_ptr <= wr_ptr + 1;
+
+                        // Go to drop if the pointer is about to overflow
+                        // we should not be accessing BRAM addresses above 2047
+                        if (wr_ptr == '1) begin 
+                            wr_state <= WR_DROP;
+                        end 
 
                         // Buffer 0 is being written to
                         if (wr_buf_sel == 1'b0) begin 
@@ -101,13 +135,24 @@ module rx_frame_buffer (
 
                         if (i_rx_last) begin 
                             wr_state <= WR_WAIT;
+                            
+                            if (i_frame_bad)  frame_bad_during_last  <= 1'b1;
+                            if (i_frame_good) frame_good_during_last <= 1'b1;
                         end 
                     end 
                 end 
 
                 WR_WAIT : begin
-                    if (i_frame_good) begin 
-                        wr_state       <= WR_READY;
+                    if (i_frame_bad || frame_bad_during_last) begin 
+                        wr_state <= WR_READY;
+
+                        if (wr_buf_sel == 1'b0) begin 
+                            wr_buf_0_full  <= 1'b0;
+                        end else begin 
+                            wr_buf_1_full  <= 1'b0;
+                        end 
+                    end else if (i_frame_good || frame_good_during_last) begin 
+                        wr_state <= WR_READY;
 
                         if (wr_buf_sel == 1'b0) begin 
                             wr_buf_0_full <= 1'b1;
@@ -116,77 +161,100 @@ module rx_frame_buffer (
                             wr_buf_1_full <= 1'b1;
                             wr_ptr_reg_1  <= wr_ptr;
                         end 
-                    end else if (i_frame_bad) begin 
-                        wr_state <= WR_READY;
                     end 
                 end
+
+                WR_DROP : begin 
+                    if (i_rx_last) begin 
+                        wr_state <= WR_READY;
+                    end 
+                end 
             endcase 
         end 
     end : writer 
 
     logic [10:0] rd_ptr_size; 
     logic [10:0] rd_ptr;
-    logic [7:0] nxt_byte;
     logic rd_buf_sel;   // 0 => buf 0, 1 => buf 1
     logic rd_buf_0_done;
     logic rd_buf_1_done;
 
     always_ff @(posedge i_clk or negedge i_n_reset) begin : reader 
         if (!i_n_reset) begin
-            
-        end else begin 
             m_axis_tvalid <= 1'b0;
             m_axis_tlast  <= 1'b0;
-
+            rd_state      <= RD_READY;
+            rd_ptr        <= '0;
+            rd_buf_0_done <= 1'b0;
+            rd_buf_1_done <= 1'b0;
+        end else begin 
+            
             case (rd_state)
 
                 RD_READY : begin 
-                    rd_buf_0_done <= 1'b0;
-                    rd_buf_1_done <= 1'b0;
+                    rd_ptr       <= 0;
+                    m_axis_tlast <= 1'b0;
+                    if (rd_buf_0_full) begin 
+                        rd_buf_sel    <= 1'b0;
+                        rd_state      <= RD_READ;
+                        rd_ptr_size   <= wr_ptr_reg_0;
+                        m_axis_tlast  <= (wr_ptr_reg_0 == 1); // ethernet frame should never have a size of 1
+                                                              // still adding this here for completeness
 
-                    if (m_axis_tready) begin 
-                        if (rd_buf_0_full) begin 
-                            rd_buf_sel  <= 1'b0;
-                            state       <= RD_READ;
-                            rd_ptr_size <= wr_ptr_reg_0;
-                            nxt_byte    <= ping_pong_buf_0[0];
-                        end else if (rd_buf_1_full) begin 
-                            rd_buf_sel  <= 1'b1;
-                            state       <= RD_READ;
-                            rd_ptr_size <= wr_ptr_reg_1;
-                            nxt_byte    <= ping_pong_buf_0[1];
-                        end 
+                        m_axis_tvalid <= 1'b1;
+                        m_axis_tdata  <= ping_pong_buf_0[0];
+                    end else if (rd_buf_1_full) begin 
+                        rd_buf_sel    <= 1'b1;
+                        rd_state      <= RD_READ;
+                        rd_ptr_size   <= wr_ptr_reg_1;
+                        m_axis_tlast  <= (wr_ptr_reg_1 == 1); // ethernet frame should never have a size of 1
+                                                              // still adding this here for completeness
+                        
+                        m_axis_tvalid <= 1'b1;
+                        m_axis_tdata  <= ping_pong_buf_1[0];
                     end 
                 end 
 
                 RD_READ : begin 
-                    if (m_axis_tready) begin 
-                        if (rd_ptr <= rd_ptr_size) begin 
-                            if (rd_buf_sel) begin 
-                                nxt_byte <= ping_pong_buf_0[rd_ptr + 1];
-                            end else begin 
-                                nxt_byte <= ping_pong_buf_1[rd_ptr + 1];
-                            end 
-
-                            m_axis_tvalid <= 1'b1;
-                            m_axis_tdata  <= nxt_byte;
+                    if (m_axis_tvalid && m_axis_tready) begin 
+                        if (!rd_buf_sel) begin 
+                            m_axis_tdata <= ping_pong_buf_0[rd_ptr + 1];
                         end else begin 
-                            m_axis_tvalid <= 1'b1;
-                            m_axis_tdata  <= nxt_byte;
-                            m_axis_tlast  <= 1'b1;
-                            state         <= RD_WAIT;
+                            m_axis_tdata <= ping_pong_buf_1[rd_ptr + 1];
                         end 
+
+                        if ((rd_ptr + 1) == rd_ptr_size - 1) begin 
+                            m_axis_tlast  <= 1'b1;
+                        end else if (rd_ptr == rd_ptr_size - 1) begin 
+                            m_axis_tvalid <= 1'b0;
+                            m_axis_tlast  <= 1'b0;
+                            rd_state      <= RD_WAIT;
+                        end 
+
+                        rd_ptr <= rd_ptr + 1;
                     end 
                 end 
 
                 RD_WAIT : begin 
-                    if (rd_buf_sel) begin 
+                    m_axis_tvalid <= 1'b0;
+                    rd_state      <= RD_CDC_ACK;
+
+                    if (!rd_buf_sel) begin 
                         rd_buf_0_done <= 1'b1;
                     end else begin 
                         rd_buf_1_done <= 1'b1;
                     end 
                 end 
 
+                RD_CDC_ACK : begin 
+                    if (!rd_buf_sel && !rd_buf_0_full) begin 
+                        rd_buf_0_done <= 1'b0;
+                        rd_state      <= RD_READY;
+                    end else if (rd_buf_sel && !rd_buf_1_full) begin 
+                        rd_buf_1_done <= 1'b0;
+                        rd_state      <= RD_READY;
+                    end 
+                end 
             endcase 
         end 
     end : reader 
@@ -206,8 +274,8 @@ module rx_frame_buffer (
             rd_buf_0_full <= 1'b0;
             rd_buf_1_full <= 1'b0;
         end else begin 
-            rd_buf_0_full_ff1 <= buf_0_used;
-            rd_buf_1_full_ff1 <= buf_1_used;
+            rd_buf_0_full_ff1 <= wr_buf_0_full;
+            rd_buf_1_full_ff1 <= wr_buf_1_full;
             rd_buf_0_full <= rd_buf_0_full_ff1;
             rd_buf_1_full <= rd_buf_1_full_ff1;
         end 
