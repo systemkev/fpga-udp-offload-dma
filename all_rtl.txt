@@ -1,0 +1,1281 @@
+=== FILE: C:\Users\kevin\Desktop\projects\ethernet\fpga-udp-offload-dma\mac\rtl\ethernet_dispatch.sv ===
+import common_pkg::*;
+
+module ethernet_dispatch (
+    // System
+    input  logic       i_clk,
+    input  logic       i_n_reset,
+
+    // AXIS input from rx_frame_buffer
+    input  logic [7:0]  s_axis_tdata,
+    input  logic        s_axis_tvalid,
+    input  logic        s_axis_tlast,
+    output logic        s_axis_tready,
+
+    // Frame metadata from rx_frame_buffer
+    input  logic        i_frame_meta_valid,
+    output logic        o_frame_meta_ready,
+    input  logic [10:0] i_frame_size,
+
+    // payload output
+    input  logic        m_axis_tready,
+    output logic [7:0]  m_axis_tdata,
+    output logic        m_axis_tvalid,
+    output logic        m_axis_tlast,
+
+    // metadata/classification
+    input  logic              i_meta_ready,
+    output logic              o_meta_valid,
+    output logic [47:0]       o_dst_mac,
+    output logic [47:0]       o_src_mac,
+    output t_ethernet_types   o_ethertype,
+    output logic [10:0]       o_frame_size
+);
+
+    logic [13:0][7:0] mac_reg;
+    logic [3:0] ptr;
+
+    // Frame size associated with the frame currently being parsed
+    logic [10:0] frame_size_reg;
+
+    // Set once frame-size metadata has been received.
+    // Ethernet data is not accepted until this is 1.
+    logic frame_meta_loaded;
+
+    typedef enum logic [2:0] {
+        DISP_IDLE,
+        DISP_MAC_REG,
+        DISP_OUTPUT,
+        DISP_STREAM,
+        DISP_DROP
+    } t_dispatch_fsm;
+
+    t_dispatch_fsm disp_state;
+
+    // rx_frame_buffer may send metadata only while we're waiting
+    // for a new Ethernet frame.
+    always_comb begin
+        o_frame_meta_ready =
+            (disp_state == DISP_IDLE) && !frame_meta_loaded;
+    end
+
+    // in the stream phase, we are ready to accept new data if
+    //      1. m_axis_tvalid is currently 0
+    //      2. this cycle, an output byte is being consumed
+    always_comb begin
+        case (disp_state)
+
+            // Do not accept byte 0 until its frame-size metadata
+            // has been received.
+            DISP_IDLE:
+                s_axis_tready = frame_meta_loaded;
+
+            DISP_STREAM:
+                s_axis_tready = (m_axis_tready && !m_axis_tlast) || !m_axis_tvalid;
+
+            DISP_MAC_REG, DISP_DROP:
+                s_axis_tready = 1'b1;
+
+            DISP_OUTPUT:
+                s_axis_tready = 1'b0;
+
+            default:
+                s_axis_tready = 1'b0;
+
+        endcase
+    end
+
+    logic frame_ended_on_header;
+
+    always_ff @(posedge i_clk or negedge i_n_reset) begin
+        if (!i_n_reset) begin
+            disp_state         <= DISP_IDLE;
+            ptr                <= '0;
+
+            m_axis_tvalid      <= 1'b0;
+            m_axis_tlast       <= 1'b0;
+            m_axis_tdata       <= '0;
+
+            o_dst_mac          <= '0;
+            o_src_mac          <= '0;
+            o_meta_valid       <= 1'b0;
+            o_ethertype        <= ETH_INVALID;
+            o_frame_size       <= '0;
+
+            frame_size_reg     <= '0;
+            frame_meta_loaded  <= 1'b0;
+            
+            frame_ended_on_header <= 1'b0;
+
+        end else begin
+
+            // Capture frame metadata before accepting byte 0.
+            if (i_frame_meta_valid && o_frame_meta_ready) begin
+                frame_size_reg    <= i_frame_size;
+                frame_meta_loaded <= 1'b1;
+            end
+
+            case (disp_state)
+
+                DISP_IDLE : begin
+                    ptr           <= '0;
+                    m_axis_tlast  <= 1'b0;
+                    m_axis_tvalid <= 1'b0;
+                    o_meta_valid  <= 1'b0;
+
+                    frame_ended_on_header <= 1'b0;
+
+                    // We only get here with s_axis_tready=1 once
+                    // frame metadata has already been captured.
+                    if (s_axis_tvalid && s_axis_tready) begin
+                        mac_reg[0] <= s_axis_tdata;
+
+                        if (s_axis_tlast) begin
+                            // Truncated Ethernet header
+                            disp_state        <= DISP_IDLE;
+                            ptr               <= '0;
+                            frame_meta_loaded <= 1'b0;
+                        end else begin
+                            disp_state <= DISP_MAC_REG;
+                            ptr        <= 4'd1;
+                        end
+                    end
+                end
+
+                DISP_MAC_REG : begin
+                    if (s_axis_tvalid && s_axis_tready) begin
+                        ptr          <= ptr + 1;
+                        mac_reg[ptr] <= s_axis_tdata;
+
+                        // Byte 13 is the final byte of the Ethernet header.
+                        if (ptr == 4'd13) begin
+                            frame_ended_on_header <= s_axis_tlast;
+                            disp_state            <= DISP_OUTPUT;
+
+                        end else if (s_axis_tlast) begin
+                            // TLAST before byte 13 => truncated Ethernet header.
+                            disp_state        <= DISP_IDLE;
+                            frame_meta_loaded <= 1'b0;
+                        end
+                    end
+                end
+
+                DISP_OUTPUT : begin
+                    if ({mac_reg[12], mac_reg[13]} == IPV4_ETHERTYPE) begin
+                        o_meta_valid <= 1'b1;
+
+                        o_dst_mac <= {
+                            mac_reg[0], mac_reg[1], mac_reg[2],
+                            mac_reg[3], mac_reg[4], mac_reg[5]
+                        };
+
+                        o_src_mac <= {
+                            mac_reg[6], mac_reg[7], mac_reg[8],
+                            mac_reg[9], mac_reg[10], mac_reg[11]
+                        };
+
+                        o_ethertype  <= ETH_IPV4;
+                        o_frame_size <= frame_size_reg - 11'd14;
+
+                    end else if ({mac_reg[12], mac_reg[13]} == ARP_ETHERTYPE) begin
+                        o_meta_valid <= 1'b1;
+
+                        o_dst_mac <= {
+                            mac_reg[0], mac_reg[1], mac_reg[2],
+                            mac_reg[3], mac_reg[4], mac_reg[5]
+                        };
+
+                        o_src_mac <= {
+                            mac_reg[6], mac_reg[7], mac_reg[8],
+                            mac_reg[9], mac_reg[10], mac_reg[11]
+                        };
+
+                        o_ethertype  <= ETH_ARP;
+                        o_frame_size <= frame_size_reg - 11'd14;
+
+                    end else begin
+                        o_meta_valid <= 1'b0;
+
+                        if (frame_ended_on_header) begin
+                            // Unsupported frame already ended.
+                            // Nothing remains to drain.
+                            disp_state            <= DISP_IDLE;
+                            frame_meta_loaded     <= 1'b0;
+                            frame_ended_on_header <= 1'b0;
+                        end else begin
+                            disp_state <= DISP_DROP;
+                        end
+                    end
+                    
+                    if (o_meta_valid && i_meta_ready) begin
+                        o_meta_valid <= 1'b0;
+
+                        if (frame_ended_on_header) begin
+                            // Valid Ethernet frame with zero L3 payload.
+                            disp_state            <= DISP_IDLE;
+                            frame_meta_loaded     <= 1'b0;
+                            frame_ended_on_header <= 1'b0;
+                        end else begin
+                            disp_state <= DISP_STREAM;
+                        end
+                    end
+                end
+
+                DISP_STREAM : begin
+                    if (m_axis_tready && m_axis_tvalid && m_axis_tlast) begin
+
+                        disp_state        <= DISP_IDLE;
+                        m_axis_tvalid     <= 1'b0;
+                        m_axis_tlast      <= 1'b0;
+
+                        // Current frame is completely finished.
+                        // Allow metadata for the next frame.
+                        frame_meta_loaded <= 1'b0;
+
+                    end else if (s_axis_tready) begin
+
+                        if (s_axis_tvalid) begin
+                            m_axis_tvalid <= 1'b1;
+                            m_axis_tdata  <= s_axis_tdata;
+                            m_axis_tlast  <= s_axis_tlast;
+                        end else begin
+                            m_axis_tvalid <= 1'b0;
+                            m_axis_tlast  <= 1'b0;
+                        end
+                    end
+                end
+
+                DISP_DROP : begin
+                    if (s_axis_tvalid &&
+                        s_axis_tready &&
+                        s_axis_tlast) begin
+
+                        disp_state        <= DISP_IDLE;
+                        frame_meta_loaded <= 1'b0;
+                    end
+                end
+
+                default: begin
+                    disp_state        <= DISP_IDLE;
+                    m_axis_tvalid     <= 1'b0;
+                    m_axis_tlast      <= 1'b0;
+                    o_meta_valid      <= 1'b0;
+                    frame_meta_loaded <= 1'b0;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+=== FILE: C:\Users\kevin\Desktop\projects\ethernet\fpga-udp-offload-dma\mac\rtl\ipv4_rx.sv ===
+import common_pkg::*;
+
+module ipv4_rx (
+    // System
+    input  logic i_clk,
+    input  logic i_n_reset,
+
+    // AXIS8 IPv4 packet input from ethernet_dispatch
+    input  logic [7:0] s_axis_tdata,
+    input  logic       s_axis_tvalid,
+    input  logic       s_axis_tlast,
+    output logic       s_axis_tready,
+
+    // Ethernet metadata carried with this packet
+    input  logic [47:0] i_src_mac,
+    input  logic [47:0] i_dst_mac,
+    input  logic [10:0] i_frame_size,
+
+    // AXIS8 IP payload output
+    output logic [7:0] m_axis_tdata,
+    output logic       m_axis_tvalid,
+    output logic       m_axis_tlast,
+    input  logic       m_axis_tready,
+
+    // IPv4 metadata output
+    output t_ipv4_metadata o_ipv4_meta,
+    output logic           o_ipv4_meta_valid,
+    input  logic           i_ipv4_meta_ready,
+
+    // Configuration
+    input  logic [31:0] i_local_ip
+);
+
+    typedef enum logic [2:0] {
+        ST_IDLE,
+        ST_HEADER,
+        ST_META,
+        ST_STREAM,
+        ST_DROP
+    } t_ipv4_rx_fsm; 
+
+    t_ipv4_rx_fsm state;
+    t_ipv4_metadata meta;
+
+    logic [4:0] header_ptr; // used to track how many header bytes we've received
+    logic [15:0] payload_ptr;
+
+    always_comb begin
+        case (state)
+            ST_STREAM: 
+                s_axis_tready = (m_axis_tready && !m_axis_tlast) || !m_axis_tvalid;
+
+            ST_IDLE, ST_HEADER, ST_DROP: 
+                s_axis_tready = 1'b1;
+
+            ST_META:
+                s_axis_tready = 1'b0;
+
+            default: 
+                s_axis_tready = 1'b0;
+        endcase 
+    end
+
+    logic is_last_stream;
+    logic is_last_meta;
+
+    always_ff @(posedge i_clk or negedge i_n_reset) begin 
+        if (!i_n_reset) begin 
+            state             <= ST_IDLE;
+            m_axis_tdata      <= '0;
+            m_axis_tvalid     <= 1'b0;
+            m_axis_tlast      <= 1'b0;
+            o_ipv4_meta       <= '0;
+            o_ipv4_meta_valid <= 1'b0;
+            header_ptr        <= '0;
+            payload_ptr       <= '0;
+            meta              <= '0;
+            is_last_meta      <= 1'b0;
+            is_last_stream    <= 1'b0;
+        end else begin 
+            case (state)
+                ST_IDLE : begin 
+                    meta        <= '0;
+                    header_ptr  <= '0;
+                    payload_ptr <= '0;
+
+                    is_last_meta      <= 1'b0;
+                    is_last_stream    <= 1'b0;
+                    o_ipv4_meta       <= '0;
+                    o_ipv4_meta_valid <= 1'b0;
+
+                    if (s_axis_tvalid && s_axis_tready) begin 
+                        if (s_axis_tdata[7:4] == 4'd4 && s_axis_tdata[3:0] == 4'd5) begin 
+                            state         <= ST_HEADER;
+                            header_ptr    <= 5'd1;
+                            m_axis_tlast  <= 1'b0;
+                            m_axis_tvalid <= 1'b0;
+                            
+                            meta.src_mac <= i_src_mac;
+                            meta.dst_mac <= i_dst_mac;
+                            meta.version <= s_axis_tdata[7:4];
+                            meta.ihl     <= s_axis_tdata[3:0];
+
+                            if (s_axis_tlast) begin 
+                                state    <= ST_IDLE;
+                            end 
+                        end else begin 
+                            if (s_axis_tlast) begin 
+                                state    <= ST_IDLE;
+                            end else begin
+                                state    <= ST_DROP;
+                            end  
+                        end 
+                    end 
+                end 
+
+                ST_HEADER : begin 
+                    if (s_axis_tvalid && s_axis_tready) begin 
+                        header_ptr <= header_ptr + 1;
+
+                        case (header_ptr)
+                            5'd1 : begin 
+                                // byte 1 ignored for now
+                            end 
+
+                            5'd2 : begin 
+                                meta.total_len[15:8] <= s_axis_tdata;
+                            end 
+
+                            5'd3 : begin
+                                meta.total_len[7:0] <= s_axis_tdata;
+
+                                // i_frame_size is the complete Ethernet frame length
+                                // excluding FCS and the 14-byte Ethernet header.
+                                //
+                                // Therefore: available IPv4 bytes = i_frame_size 
+                                //
+                                // IPv4 total_len may be LESS than the available bytes because
+                                // Ethernet padding can exist after the IP packet.
+
+                                if ({meta.total_len[15:8], s_axis_tdata} < {meta.ihl, 2'b0}) begin
+                                    // IPv4 total length is smaller than its own header.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+
+                                end else if (i_frame_size < 11'd14) begin
+                                    // Defensive check: an Ethernet frame reaching here should
+                                    // always contain at least the Ethernet header.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+
+                                end else if ({meta.total_len[15:8], s_axis_tdata} > (i_frame_size)) begin
+                                    // IPv4 header claims more bytes than actually exist
+                                    // in the containing Ethernet frame.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+                                end
+                            end
+
+                            // no checks, just metadata
+                            5'd4 : begin 
+                                meta.id_field[15:8] <= s_axis_tdata;
+                            end 
+
+                            // no checks, just metadata
+                            5'd5 : begin 
+                                meta.id_field[7:0] <= s_axis_tdata;
+                            end 
+
+                            5'd6 : begin 
+                                // ensure MF (more fragments) is 0
+                                // we currently dont support MF
+                                if (s_axis_tdata[7] || s_axis_tdata[5]) begin 
+                                    state <= ST_DROP;
+                                end 
+
+                                // start capture of fragment offset (should also be 0 for now)
+                                meta.frag_offset[12:8] <= s_axis_tdata[4:0];
+                            end 
+
+                            5'd7 : begin 
+                                // ensure fragment offset is 0
+                                if ({meta.frag_offset[12:8], s_axis_tdata} != '0) begin 
+                                    state <= ST_DROP;
+                                end 
+
+                                // start capture of fragment offset (should also be 0 for now)
+                                meta.frag_offset[7:0] <= s_axis_tdata;
+                            end 
+
+                            5'd8 : begin 
+                                meta.ttl <= s_axis_tdata;
+                            end 
+
+                            5'd9 : begin 
+                                meta.protocol <= s_axis_tdata;
+                            end 
+
+                            5'd10 : begin 
+                                // checksum (nothing for now)
+
+                                // calculate payload length
+                                meta.payload_len <= meta.total_len - {meta.ihl, 2'b0};
+                            end 
+
+                            5'd11 : begin 
+                                // checksum (nothing for now)
+                            end 
+
+                            5'd12 : begin 
+                                meta.src_ip[31:24] <= s_axis_tdata;
+                            end 
+
+                            5'd13 : begin 
+                                meta.src_ip[23:16] <= s_axis_tdata;
+                            end
+
+                            5'd14 : begin 
+                                meta.src_ip[15:8] <= s_axis_tdata;
+                            end
+
+                            5'd15 : begin 
+                                meta.src_ip[7:0] <= s_axis_tdata;
+                            end
+
+                            5'd16 : begin 
+                                meta.dst_ip[31:24] <= s_axis_tdata;
+                            end
+
+                            5'd17 : begin 
+                                meta.dst_ip[23:16] <= s_axis_tdata;
+                            end
+
+                            5'd18 : begin 
+                                meta.dst_ip[15:8] <= s_axis_tdata;
+                            end
+
+                            5'd19 : begin 
+                                meta.dst_ip[7:0] <= s_axis_tdata;
+
+                                // check that the destination IP matches our local IP
+                                if ({meta.dst_ip[31:8], s_axis_tdata} != i_local_ip) begin  
+                                    state <= (s_axis_tlast)? ST_IDLE : ST_DROP;
+                                end else begin 
+                                    // we have a valid packet, send out metadata
+                                    state        <= ST_META;
+                                    is_last_meta <= s_axis_tlast;
+                                end 
+                            end
+                        endcase 
+
+                        if (s_axis_tlast && header_ptr < 19) begin 
+                            state <= ST_IDLE;
+                        end 
+                    end 
+                end 
+
+                ST_META : begin 
+                    o_ipv4_meta       <= meta;
+                    o_ipv4_meta_valid <= 1'b1;
+
+                    if (o_ipv4_meta_valid && i_ipv4_meta_ready) begin
+                        o_ipv4_meta_valid <= 1'b0;
+
+                        if (is_last_meta) begin 
+                            state <= ST_IDLE;
+                        end else if (meta.payload_len == '0) begin 
+                            state <= ST_DROP;
+                        end else begin 
+                            state <= ST_STREAM;
+                        end 
+                    end
+                end 
+
+                ST_STREAM : begin 
+                    if (m_axis_tready && m_axis_tvalid && m_axis_tlast) begin 
+                        m_axis_tvalid   <= 1'b0;
+                        m_axis_tlast    <= 1'b0;
+
+                        state <= (is_last_stream)? ST_IDLE : ST_DROP;
+                    end else if (s_axis_tready) begin 
+                        if (s_axis_tvalid) begin 
+                            m_axis_tdata  <= s_axis_tdata;
+                            m_axis_tvalid <= 1'b1;
+                            m_axis_tlast  <= s_axis_tlast;
+                            payload_ptr   <= payload_ptr + 1;
+
+                            if (payload_ptr == meta.payload_len - 1) begin 
+                                m_axis_tlast <= 1'b1;
+                            end 
+
+                            if (s_axis_tlast) begin 
+                                is_last_stream <= 1'b1;
+                            end 
+                        end else begin 
+                            m_axis_tvalid <= 1'b0;
+                        end 
+                    end
+                end 
+
+                ST_DROP : begin 
+                    m_axis_tvalid <= 1'b0;
+
+                    if (s_axis_tvalid && s_axis_tready && s_axis_tlast) begin 
+                        state <= ST_IDLE;
+                    end 
+                end 
+            endcase 
+        end 
+    end 
+endmodule 
+
+=== FILE: C:\Users\kevin\Desktop\projects\ethernet\fpga-udp-offload-dma\mac\rtl\ip_dispatch.sv ===
+import common_pkg::*;
+
+module ip_dispatch (
+    // System
+    input  logic i_clk,
+    input  logic i_n_reset,
+
+    // IPv4 metadata input from ipv4_rx
+    input  t_ipv4_metadata i_ipv4_meta,
+    input  logic           i_ipv4_meta_valid,
+    output logic           o_ipv4_meta_ready,
+
+    // AXIS8 IPv4 payload input from ipv4_rx
+    input  logic [7:0] s_axis_tdata,
+    input  logic       s_axis_tvalid,
+    input  logic       s_axis_tlast,
+    output logic       s_axis_tready,
+
+    // IPv4 metadata output to udp_rx
+    output t_ipv4_metadata o_udp_ipv4_meta,
+    output logic           o_udp_ipv4_meta_valid,
+    input  logic           i_udp_ipv4_meta_ready,
+
+    // AXIS8 UDP packet input to udp_rx
+    output logic [7:0] m_axis_tdata,
+    output logic       m_axis_tvalid,
+    output logic       m_axis_tlast,
+    input  logic       m_axis_tready
+);
+
+    localparam logic [7:0] IPV4_PROTOCOL_UDP = 8'd17;
+
+    typedef enum logic [1:0] {
+        DISP_IDLE,
+        DISP_META,
+        DISP_STREAM,
+        DISP_DROP
+    } t_ip_dispatch_fsm;
+
+    t_ip_dispatch_fsm state;
+
+    t_ipv4_metadata meta_reg;
+
+
+    // ----------------------------------------------------------------
+    // Combinational interface control
+    // ----------------------------------------------------------------
+    always_comb begin
+        o_ipv4_meta_ready     = 1'b0;
+
+        o_udp_ipv4_meta       = meta_reg;
+        o_udp_ipv4_meta_valid = 1'b0;
+
+        s_axis_tready         = 1'b0;
+
+        m_axis_tdata          = s_axis_tdata;
+        m_axis_tvalid         = 1'b0;
+        m_axis_tlast          = 1'b0;
+
+        case (state)
+
+            // Metadata always arrives before the payload from ipv4_rx.
+            DISP_IDLE : begin
+                o_ipv4_meta_ready = 1'b1;
+            end
+
+            // For UDP, publish the IPv4 metadata before allowing any
+            // transport bytes to move downstream.
+            DISP_META : begin
+                o_udp_ipv4_meta_valid = 1'b1;
+            end
+
+            // No parsing is required here. Once classified as UDP,
+            // the transport packet is simply forwarded to udp_rx.
+            DISP_STREAM : begin
+                s_axis_tready = m_axis_tready;
+
+                m_axis_tdata  = s_axis_tdata;
+                m_axis_tvalid = s_axis_tvalid;
+                m_axis_tlast  = s_axis_tlast;
+            end
+
+            // Unsupported IPv4 protocols are consumed completely,
+            // independent of downstream readiness.
+            DISP_DROP : begin
+                s_axis_tready = 1'b1;
+            end
+
+            default : begin
+                o_ipv4_meta_ready = 1'b0;
+                s_axis_tready     = 1'b0;
+            end
+
+        endcase
+    end
+
+
+    // ----------------------------------------------------------------
+    // Packet-level dispatch FSM
+    // ----------------------------------------------------------------
+    always_ff @(posedge i_clk or negedge i_n_reset) begin
+        if (!i_n_reset) begin
+            
+            state    <= DISP_IDLE;
+            meta_reg <= '0;
+
+        end else begin
+
+            case (state)
+            
+                DISP_IDLE : begin
+                    if (i_ipv4_meta_valid && o_ipv4_meta_ready) begin
+                        meta_reg <= i_ipv4_meta;
+
+                        if (i_ipv4_meta.protocol == IPV4_PROTOCOL_UDP) begin
+                            // UDP metadata must be accepted before
+                            // transport payload is allowed through.
+                            state <= DISP_META;
+
+                        end else if (i_ipv4_meta.payload_len == 16'd0) begin
+                            // Unsupported protocol with no payload:
+                            // there is nothing left to drain.
+                            state <= DISP_IDLE;
+
+                        end else begin
+                            state <= DISP_DROP;
+                        end
+                    end
+                end
+
+
+                DISP_META : begin
+                    if (o_udp_ipv4_meta_valid && i_udp_ipv4_meta_ready) begin
+                        if (meta_reg.payload_len == 16'd0) begin
+                            // Valid zero-byte IPv4 payload. Metadata is
+                            // forwarded, but there is no AXIS packet.
+                            state <= DISP_IDLE;
+                        end else begin
+                            state <= DISP_STREAM;
+                        end
+                    end
+                end
+
+
+                DISP_STREAM : begin
+                    if (s_axis_tvalid && s_axis_tready && s_axis_tlast) begin
+                        state <= DISP_IDLE;
+                    end
+                end
+
+
+                DISP_DROP : begin
+                    if (s_axis_tvalid && s_axis_tready && s_axis_tlast) begin
+                        state <= DISP_IDLE;
+                    end
+                end
+
+
+                default : begin
+                    state <= DISP_IDLE;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+=== FILE: C:\Users\kevin\Desktop\projects\ethernet\fpga-udp-offload-dma\mac\rtl\mii_rx_mac.sv ===
+import common_pkg::*;
+
+module mii_rx_mac (
+    input  logic       i_rx_clk,
+    input  logic       i_n_reset,
+
+    // MII interface from Ethernet PHY
+    input  logic [3:0] i_mii_rxd,
+    input  logic       i_mii_rx_dv,
+    input  logic       i_mii_rx_er,
+
+    // Received Ethernet frame bytes
+    output logic [7:0] o_rx_data,
+    output logic       o_rx_valid,
+    output logic       o_rx_last,
+
+    // Frame status
+    output logic       o_frame_good,
+    output logic       o_frame_bad
+);
+
+    function automatic logic [31:0] crc32_next_byte(
+        input logic [31:0] crc,
+        input logic [7:0]  data
+    );
+        logic [31:0] current_crc;
+        current_crc = crc;
+        
+        for (int i = 0; i < 8; i++) begin
+            if ((current_crc[0] ^ data[i]) == 1'b1) begin
+                current_crc = (current_crc >> 1) ^ 32'hEDB88320;
+            end else begin
+                current_crc = (current_crc >> 1);
+            end
+        end
+        return current_crc;
+    endfunction
+
+    // Input registers
+    logic [3:0] rxd;
+    logic       rxdv;
+    logic       rxer;
+
+    always_ff @(posedge i_rx_clk or negedge i_n_reset) begin
+        if (!i_n_reset) begin
+            rxd  <= '0;
+            rxdv <= 1'b0;
+            rxer <= 1'b0;
+        end else begin
+            rxd  <= i_mii_rxd;
+            rxdv <= i_mii_rx_dv;
+            rxer <= i_mii_rx_er;
+        end
+    end
+
+    // Nibble to Byte Assembly
+    logic       nibble_phase;
+    logic [3:0] low_nibble;
+    logic [7:0] rx_byte;
+    logic       rx_vld;   
+
+    always_ff @(posedge i_rx_clk or negedge i_n_reset) begin
+        if (!i_n_reset) begin
+            nibble_phase  <= 1'b0;
+        end else begin 
+            if (rxdv) begin
+                rx_vld  <= 1'b0;
+                nibble_phase  <= ~nibble_phase;
+                low_nibble    <= rxd;
+
+                if (nibble_phase == 1'b1) begin
+                    rx_vld  <= 1'b1;
+                    rx_byte <= {rxd, low_nibble};     
+                end
+            end else begin 
+                rx_vld  <= 1'b0;
+                nibble_phase  <= 1'b0;
+            end 
+        end 
+    end
+
+    // FSM and 4-byte FCS Shift Register
+    typedef enum logic [2:0] {
+        RX_IDLE,
+        RX_PREAMBLE,
+        RX_FRAME,
+        RX_DONE,
+        RX_DROP
+    } t_rx_state;
+
+    t_rx_state state;
+
+    logic [2:0] arrived_cnt;
+    logic [10:0] counter;
+    logic [31:0] crc; 
+    logic [3:0][7:0] shft_reg;
+
+    always_ff @(posedge i_rx_clk or negedge i_n_reset) begin 
+        if (!i_n_reset) begin
+            state        <= RX_IDLE;
+            crc          <= '1;
+            shft_reg     <= '0;
+            o_frame_bad  <= 1'b0;
+            o_frame_good <= 1'b0;
+            o_rx_last    <= 1'b0;
+            o_rx_valid   <= 1'b0;
+            arrived_cnt  <= '0;
+            counter      <= '0;
+        end else begin
+            if (rxer && rxdv && state != RX_DROP) begin 
+                state        <= RX_DROP;
+                o_frame_bad  <= 1'b1;
+            end else begin 
+                o_rx_last  <= 1'b0;
+                o_rx_valid <= 1'b0;
+                o_frame_good <= 1'b0;
+                o_frame_bad  <= 1'b0;
+
+                case (state)
+
+                    RX_IDLE : begin 
+                        arrived_cnt <= '0;
+                        counter     <= '0;
+                        crc         <= '1;
+                        if (rx_vld && rx_byte == 8'h55) begin 
+                            state <= RX_PREAMBLE;
+                        end 
+                    end 
+
+                    RX_PREAMBLE : begin 
+                        if (rx_byte == 8'h55) begin 
+                            // do nothing
+                        end else if (rx_byte == 8'hD5) begin 
+                            state       <= RX_FRAME;
+                        end else begin 
+                            o_frame_bad <= 1'b1;
+                            state       <= RX_DROP;
+                        end
+                    end
+
+                    RX_FRAME : begin 
+                        if (rxdv) begin 
+                            if (counter >= MAX_PAYLOAD_SIZE) begin 
+                                o_frame_bad <= 1'b1;
+                                state       <= RX_DROP;
+                            end else if (rx_vld) begin 
+                                shft_reg <= {shft_reg[2:0], rx_byte};
+
+                                counter <= counter + 1;
+
+                                if (arrived_cnt < 4) begin 
+                                    arrived_cnt <= arrived_cnt + 1;
+                                end else begin 
+                                    crc <= crc32_next_byte(crc, shft_reg[3]);
+                                    
+                                    o_rx_valid <= 1'b1;
+                                    o_rx_data  <= shft_reg[3];
+                                end 
+                            end 
+                        end else begin 
+                            o_rx_last  <= 1'b1;
+                            o_rx_valid <= 1'b1;
+                            o_rx_data  <= shft_reg[3];
+                            crc        <= crc32_next_byte(crc, shft_reg[3]);
+                            state      <= RX_DONE; 
+                        end 
+                    end
+
+                    RX_DONE : begin 
+                        state <= RX_DROP;
+
+                        if (counter < MIN_PAYLOAD_SIZE) begin 
+                            o_frame_bad  <= 1'b1;
+                        end else if (~crc == {rx_byte, shft_reg[0], shft_reg[1], shft_reg[2]}) begin 
+                            o_frame_good <= 1'b1;
+                        end else begin 
+                            o_frame_bad  <= 1'b1;
+                        end 
+                    end
+
+                    RX_DROP : begin 
+                        if (!rxdv) begin 
+                            state <= RX_IDLE;
+                        end 
+                    end
+
+                endcase 
+            end 
+        end
+    end
+endmodule
+
+=== FILE: C:\Users\kevin\Desktop\projects\ethernet\fpga-udp-offload-dma\mac\rtl\rx_frame_buffer.sv ===
+module rx_frame_buffer (
+    // RX clock domain
+    input  logic       i_rx_clk,
+    input  logic       i_rx_n_reset,
+
+    // from mii_rx_mac
+    input  logic [7:0] i_rx_data,
+    input  logic       i_rx_valid,
+    input  logic       i_rx_last,
+    input  logic       i_frame_good,
+    input  logic       i_frame_bad,
+
+    // system-AXI clock domain
+    input  logic       i_clk,
+    input  logic       i_n_reset,
+
+    // AXI4-Stream output
+    output logic [7:0] m_axis_tdata,
+    output logic       m_axis_tvalid,
+    input  logic       m_axis_tready,
+    output logic       m_axis_tlast,
+
+    // Metadata handshaking 
+    input  logic        i_meta_ready,
+    output logic        o_meta_valid,
+    output logic [10:0] o_frame_size,   
+
+    // status
+    output logic       o_buf_ovf
+);
+
+    logic [7:0] ping_pong_buf_0 [0:2047];
+    logic [7:0] ping_pong_buf_1 [0:2047];
+
+    logic [10:0] wr_ptr;         // pointer to track writing process
+    logic [10:0] wr_ptr_reg_0;   // latched pointer for CDC (buf 0)
+    logic [10:0] wr_ptr_reg_1;   // latched pointer for CDC (buf 1)
+    logic wr_buf_sel;    // 0 => writing to buf 0, 1 => writing to buf 1
+    logic wr_buf_0_full; // 1 => buffer 0 is full and valid, and thus can be read 
+    logic wr_buf_1_full; // 1 => buffer 1 is full and valid, and thus can be read
+
+    typedef enum logic [2:0] {
+        WR_READY,
+        WR_WRITE, 
+        WR_WAIT,
+        WR_DROP
+    } t_writer_fsm;
+
+    typedef enum logic [2:0] {
+        RD_READY,
+        RD_META,
+        RD_READ,
+        RD_WAIT,
+        RD_CDC_ACK
+    } t_reader_fsm;
+
+    t_writer_fsm wr_state;
+    t_reader_fsm rd_state;
+
+    logic frame_bad_during_last;
+    logic frame_good_during_last;
+
+    always_ff @(posedge i_rx_clk or negedge i_rx_n_reset) begin : writer 
+        if (!i_rx_n_reset) begin
+            wr_state              <= WR_READY;
+            wr_ptr                <= '0;
+            wr_ptr_reg_0          <= '0;
+            wr_ptr_reg_1          <= '0;
+            wr_buf_sel            <= 1'b0;
+
+            wr_buf_0_full         <= 1'b0;
+            wr_buf_1_full         <= 1'b0;
+
+            frame_bad_during_last <= 1'b0;
+            frame_good_during_last<= 1'b0;
+
+            o_buf_ovf             <= 1'b0;
+        end else begin 
+            o_buf_ovf <= 1'b0;
+
+            // CDC handshaking with the reader module
+            if (wr_buf_0_full && wr_buf_0_sent)
+                wr_buf_0_full  <= 1'b0;
+            
+            if (wr_buf_1_full && wr_buf_1_sent)
+                wr_buf_1_full  <= 1'b0;
+
+            case (wr_state)
+
+                WR_READY : begin 
+                    if (i_rx_valid) begin 
+                        wr_ptr   <= 11'b0;
+                        wr_state <= WR_WRITE;
+
+                        frame_bad_during_last  <= 1'b0;
+                        frame_good_during_last <= 1'b0;
+
+                        if (!wr_buf_0_full && !wr_buf_0_sent) begin 
+                            wr_ptr             <= 1'b1;
+                            wr_buf_sel         <= 1'b0;
+
+                            if (!i_rx_last) begin 
+                                ping_pong_buf_0[0] <= i_rx_data;
+                            end else begin 
+                                wr_state <= WR_DROP;
+                            end 
+                        end else if (!wr_buf_1_full && !wr_buf_1_sent) begin 
+                            wr_ptr             <= 1'b1;
+                            wr_buf_sel         <= 1'b1;
+
+                            if (!i_rx_last) begin 
+                                ping_pong_buf_1[0] <= i_rx_data;
+                            end else begin 
+                                wr_state <= WR_DROP;
+                            end 
+                        end else begin 
+                            wr_ptr    <= 11'b0;
+                            o_buf_ovf <= 1'b1;
+                            wr_state  <= WR_DROP;
+                        end 
+                    end 
+                end 
+
+                WR_WRITE : begin 
+                    if (i_rx_valid) begin 
+                        wr_ptr <= wr_ptr + 1;
+
+                        // Go to drop if the pointer is about to overflow
+                        // we should not be accessing BRAM addresses above 2047
+                        if (wr_ptr == '1) begin 
+                            wr_state <= WR_DROP;
+                        end 
+
+                        // Buffer 0 is being written to
+                        if (wr_buf_sel == 1'b0) begin 
+                            ping_pong_buf_0[wr_ptr] <= i_rx_data;
+                        // Buffer 1 being written to
+                        end else begin 
+                            ping_pong_buf_1[wr_ptr] <= i_rx_data;
+                        end 
+
+                        if (i_rx_last) begin 
+                            wr_state <= WR_WAIT;
+                            
+                            if (i_frame_bad)  frame_bad_during_last  <= 1'b1;
+                            if (i_frame_good) frame_good_during_last <= 1'b1;
+                        end 
+                    end 
+                end 
+
+                WR_WAIT : begin
+                    if (i_frame_bad || frame_bad_during_last) begin 
+                        wr_state <= WR_READY;
+
+                        if (wr_buf_sel == 1'b0) begin 
+                            wr_buf_0_full  <= 1'b0;
+                        end else begin 
+                            wr_buf_1_full  <= 1'b0;
+                        end 
+                    end else if (i_frame_good || frame_good_during_last) begin 
+                        wr_state <= WR_READY;
+
+                        if (wr_buf_sel == 1'b0) begin 
+                            wr_buf_0_full <= 1'b1;
+                            wr_ptr_reg_0  <= wr_ptr; 
+                        end else begin 
+                            wr_buf_1_full <= 1'b1;
+                            wr_ptr_reg_1  <= wr_ptr;
+                        end 
+                    end 
+                end
+
+                WR_DROP : begin 
+                    if (i_rx_last) begin 
+                        wr_state <= WR_READY;
+                    end 
+                end 
+            endcase 
+        end 
+    end : writer 
+
+    logic [10:0] rd_ptr_size; 
+    logic [10:0] rd_ptr;
+    logic rd_buf_sel;   // 0 => buf 0, 1 => buf 1
+    logic rd_buf_0_done;
+    logic rd_buf_1_done;
+
+    always_ff @(posedge i_clk or negedge i_n_reset) begin : reader 
+        if (!i_n_reset) begin
+            m_axis_tvalid <= 1'b0;
+            m_axis_tlast  <= 1'b0;
+            rd_state      <= RD_READY;
+            rd_ptr        <= '0;
+            rd_buf_0_done <= 1'b0;
+            rd_buf_1_done <= 1'b0;
+            o_meta_valid  <= 1'b0;
+            o_frame_size  <= '0;
+        end else begin 
+            
+            case (rd_state)
+
+                RD_READY : begin
+                    rd_ptr        <= '0;
+                    m_axis_tvalid <= 1'b0;
+                    m_axis_tlast  <= 1'b0;
+                    o_meta_valid  <= 1'b0;
+
+                    if (rd_buf_0_full) begin
+                        rd_buf_sel   <= 1'b0;
+                        rd_ptr_size  <= wr_ptr_reg_0;
+
+                        // publish metadata
+                        o_frame_size <= wr_ptr_reg_0;
+                        o_meta_valid <= 1'b1;
+
+                        rd_state <= RD_META;
+
+                    end else if (rd_buf_1_full) begin
+                        rd_buf_sel   <= 1'b1;
+                        rd_ptr_size  <= wr_ptr_reg_1;
+
+                        // publish metadata
+                        o_frame_size <= wr_ptr_reg_1;
+                        o_meta_valid <= 1'b1;
+
+                        rd_state <= RD_META;
+                    end
+                end
+
+                RD_META : begin
+                    // Hold o_meta_valid and o_frame_size stable until accepted
+                    if (o_meta_valid && i_meta_ready) begin
+                        o_meta_valid <= 1'b0;
+
+                        // Now begin streaming byte 0
+                        if (!rd_buf_sel) begin
+                            m_axis_tdata <= ping_pong_buf_0[0];
+                        end else begin
+                            m_axis_tdata <= ping_pong_buf_1[0];
+                        end
+
+                        m_axis_tvalid <= 1'b1;
+                        m_axis_tlast  <= (rd_ptr_size == 1);
+
+                        rd_state <= RD_READ;
+                    end
+                end
+
+                RD_READ : begin 
+                    if (m_axis_tvalid && m_axis_tready) begin 
+                        if (!rd_buf_sel) begin 
+                            m_axis_tdata <= ping_pong_buf_0[rd_ptr + 1];
+                        end else begin 
+                            m_axis_tdata <= ping_pong_buf_1[rd_ptr + 1];
+                        end 
+
+                        if ((rd_ptr + 1) == rd_ptr_size - 1) begin 
+                            m_axis_tlast  <= 1'b1;
+                        end else if (rd_ptr == rd_ptr_size - 1) begin 
+                            m_axis_tvalid <= 1'b0;
+                            m_axis_tlast  <= 1'b0;
+                            rd_state      <= RD_WAIT;
+                        end 
+
+                        rd_ptr <= rd_ptr + 1;
+                    end 
+                end 
+
+                RD_WAIT : begin 
+                    m_axis_tvalid <= 1'b0;
+                    rd_state      <= RD_CDC_ACK;
+
+                    if (!rd_buf_sel) begin 
+                        rd_buf_0_done <= 1'b1;
+                    end else begin 
+                        rd_buf_1_done <= 1'b1;
+                    end 
+                end 
+
+                RD_CDC_ACK : begin 
+                    if (!rd_buf_sel && !rd_buf_0_full) begin 
+                        rd_buf_0_done <= 1'b0;
+                        rd_state      <= RD_READY;
+                    end else if (rd_buf_sel && !rd_buf_1_full) begin 
+                        rd_buf_1_done <= 1'b0;
+                        rd_state      <= RD_READY;
+                    end 
+                end 
+            endcase 
+        end 
+    end : reader 
+
+    // first flip flop sync
+    logic rd_buf_0_full_ff1;
+    logic rd_buf_1_full_ff1;
+
+    // second FF sync
+    logic rd_buf_0_full;
+    logic rd_buf_1_full;
+
+    always_ff @(posedge i_clk or negedge i_n_reset) begin : cdc_wr_to_rd
+        if (!i_n_reset) begin
+            rd_buf_0_full_ff1 <= 1'b0;
+            rd_buf_1_full_ff1 <= 1'b0;
+            rd_buf_0_full <= 1'b0;
+            rd_buf_1_full <= 1'b0;
+        end else begin 
+            rd_buf_0_full_ff1 <= wr_buf_0_full;
+            rd_buf_1_full_ff1 <= wr_buf_1_full;
+            rd_buf_0_full <= rd_buf_0_full_ff1;
+            rd_buf_1_full <= rd_buf_1_full_ff1;
+        end 
+    end : cdc_wr_to_rd
+
+    // first flip flop sync
+    logic wr_buf_0_sent_ff;
+    logic wr_buf_1_sent_ff;
+
+    // second FF sync
+    logic wr_buf_0_sent;
+    logic wr_buf_1_sent;
+    always_ff @(posedge i_rx_clk or negedge i_rx_n_reset) begin : cdc_rd_to_wr 
+        if (!i_rx_n_reset) begin
+            wr_buf_0_sent_ff <= 1'b0;
+            wr_buf_1_sent_ff <= 1'b0;
+            wr_buf_0_sent    <= 1'b0;
+            wr_buf_1_sent    <= 1'b0;
+        end else begin 
+            wr_buf_0_sent_ff <= rd_buf_0_done;
+            wr_buf_1_sent_ff <= rd_buf_1_done;
+            wr_buf_0_sent <= wr_buf_0_sent_ff;
+            wr_buf_1_sent <= wr_buf_1_sent_ff;
+        end
+    end : cdc_rd_to_wr 
+
+endmodule 
+

@@ -18,6 +18,9 @@ package common_pkg;
     parameter logic [7:0] IP_PROTOCOL_TCP  = 8'd6;
     parameter logic [7:0] IP_PROTOCOL_UDP  = 8'd17;
 
+    // UDP header
+    parameter logic [3:0] UDP_HEAD_NUM_BYTES = 4'd8;
+
     typedef struct packed {
         // Carried from Ethernet layer
         logic [47:0] src_mac;

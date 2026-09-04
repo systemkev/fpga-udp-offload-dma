@@ -41,6 +41,7 @@ module ipv4_rx_TB;
 
     logic [47:0] i_src_mac;
     logic [47:0] i_dst_mac;
+    logic [10:0] i_frame_size;
 
     logic [7:0] m_axis_tdata;
     logic       m_axis_tvalid;
@@ -69,6 +70,7 @@ module ipv4_rx_TB;
 
         .i_src_mac           (i_src_mac),
         .i_dst_mac           (i_dst_mac),
+        .i_frame_size        (i_frame_size),
 
         .m_axis_tdata        (m_axis_tdata),
         .m_axis_tvalid       (m_axis_tvalid),
@@ -418,15 +420,16 @@ module ipv4_rx_TB;
 
                 if (
                     s_axis_tready !==
-                    (m_axis_tready || !m_axis_tvalid)
+                    ((m_axis_tready && !m_axis_tlast) || !m_axis_tvalid)
                 ) begin
 
                     tb_error(
                         $sformatf(
-                            "STREAM ready equation violated: s_ready=%0b m_ready=%0b m_valid=%0b",
+                            "STREAM ready equation violated: s_ready=%0b m_ready=%0b m_valid=%0b m_last=%0b",
                             s_axis_tready,
                             m_axis_tready,
-                            m_axis_tvalid
+                            m_axis_tvalid,
+                            m_axis_tlast
                         )
                     );
 
@@ -1003,8 +1006,9 @@ module ipv4_rx_TB;
 
         end
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         send_sequence(
             packet,
@@ -1149,6 +1153,7 @@ module ipv4_rx_TB;
         s_axis_tvalid <= 1'b0;
         s_axis_tlast  <= 1'b0;
         s_axis_tdata  <= '0;
+        i_frame_size  <= '0;
 
         repeat (3)
             @(posedge i_clk);
@@ -1444,8 +1449,9 @@ module ipv4_rx_TB;
         //
         // Present original MAC metadata for first byte.
         //
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         first_byte.push_back(
             packet[0]
@@ -2252,8 +2258,9 @@ module ipv4_rx_TB;
             packet
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         //
         // Downstream cannot accept anything.
@@ -2375,6 +2382,10 @@ module ipv4_rx_TB;
                 );
 
             end
+
+            // Advertise the actual number of physical IPv4-side bytes
+            // in this intentionally truncated frame.
+            i_frame_size = 11'(runt.size());
 
             expect_no_outputs = 1'b1;
 
@@ -2745,8 +2756,9 @@ module ipv4_rx_TB;
             payload
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         //
         // Accept bytes 0..6 normally.
@@ -3131,8 +3143,9 @@ module ipv4_rx_TB;
         //
         // First frame.
         //
-        i_src_mac = cfg1.src_mac;
-        i_dst_mac = cfg1.dst_mac;
+        i_src_mac    = cfg1.src_mac;
+        i_dst_mac    = cfg1.dst_mac;
+        i_frame_size = 11'(packet1.size());
 
         for (int i = 0; i < packet1.size(); i++) begin
 
@@ -3158,8 +3171,9 @@ module ipv4_rx_TB;
         // Sideband MAC metadata changes simultaneously with first byte
         // of packet 2.
         //
-        i_src_mac = cfg2.src_mac;
-        i_dst_mac = cfg2.dst_mac;
+        i_src_mac    = cfg2.src_mac;
+        i_dst_mac    = cfg2.dst_mac;
+        i_frame_size = 11'(packet2.size());
 
         for (int i = 0; i < packet2.size(); i++) begin
 
@@ -3300,8 +3314,9 @@ module ipv4_rx_TB;
             packet
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         //
         // Stop after byte 8.
@@ -3363,8 +3378,9 @@ module ipv4_rx_TB;
             packet
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         i_ipv4_meta_ready = 1'b0;
 
@@ -3435,8 +3451,9 @@ module ipv4_rx_TB;
             packet
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         i_ipv4_meta_ready = 1'b1;
 
@@ -3555,8 +3572,9 @@ module ipv4_rx_TB;
             packet
         );
 
-        i_src_mac = cfg.src_mac;
-        i_dst_mac = cfg.dst_mac;
+        i_src_mac    = cfg.src_mac;
+        i_dst_mac    = cfg.dst_mac;
+        i_frame_size = 11'(packet.size());
 
         //
         // Invalid byte 0 + several following bytes, without TLAST.
@@ -4401,8 +4419,9 @@ module ipv4_rx_TB;
         s_axis_tvalid = 1'b0;
         s_axis_tlast  = 1'b0;
 
-        i_src_mac = '0;
-        i_dst_mac = '0;
+        i_src_mac    = '0;
+        i_dst_mac    = '0;
+        i_frame_size = '0;
 
         m_axis_tready = 1'b1;
 

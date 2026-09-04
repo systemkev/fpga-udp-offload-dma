@@ -30,6 +30,11 @@ module ethernet_dispatch_TB;
     logic       s_axis_tlast;
     logic       s_axis_tready;
 
+    // Frame metadata from rx_frame_buffer
+    logic        i_frame_meta_valid;
+    logic        o_frame_meta_ready;
+    logic [10:0] i_frame_size;
+
     logic       m_axis_tready;
     logic [7:0] m_axis_tdata;
     logic       m_axis_tvalid;
@@ -40,6 +45,7 @@ module ethernet_dispatch_TB;
     logic [47:0]       o_dst_mac;
     logic [47:0]       o_src_mac;
     t_ethernet_types   o_ethertype;
+    logic [10:0]       o_frame_size;
 
 
     // ================================================================
@@ -52,10 +58,14 @@ module ethernet_dispatch_TB;
 
         .s_axis_tdata   (s_axis_tdata),
         .s_axis_tvalid  (s_axis_tvalid),
-        .s_axis_tlast   (s_axis_tlast),
-        .s_axis_tready  (s_axis_tready),
+        .s_axis_tlast        (s_axis_tlast),
+        .s_axis_tready       (s_axis_tready),
 
-        .m_axis_tready  (m_axis_tready),
+        .i_frame_meta_valid  (i_frame_meta_valid),
+        .o_frame_meta_ready  (o_frame_meta_ready),
+        .i_frame_size        (i_frame_size),
+
+        .m_axis_tready       (m_axis_tready),
         .m_axis_tdata   (m_axis_tdata),
         .m_axis_tvalid  (m_axis_tvalid),
         .m_axis_tlast   (m_axis_tlast),
@@ -64,7 +74,8 @@ module ethernet_dispatch_TB;
         .o_meta_valid   (o_meta_valid),
         .o_dst_mac      (o_dst_mac),
         .o_src_mac      (o_src_mac),
-        .o_ethertype    (o_ethertype)
+        .o_ethertype    (o_ethertype),
+        .o_frame_size   (o_frame_size)
     );
 
 
@@ -88,6 +99,7 @@ module ethernet_dispatch_TB;
         logic [47:0]     dst;
         logic [47:0]     src;
         t_ethernet_types etype;
+        logic [10:0]     frame_size; // L3 bytes after 14-byte Ethernet header
     } expected_meta_t;
 
 
@@ -252,6 +264,15 @@ module ethernet_dispatch_TB;
                                 )
                             );
 
+                        if (o_frame_size !== exp.frame_size)
+                            tb_error(
+                                $sformatf(
+                                    "Frame-size mismatch: expected %0d L3 bytes got %0d",
+                                    exp.frame_size,
+                                    o_frame_size
+                                )
+                            );
+
                     end
                 end
             end
@@ -401,7 +422,8 @@ module ethernet_dispatch_TB;
         o_meta_valid
         && $stable(o_dst_mac)
         && $stable(o_src_mac)
-        && $stable(o_ethertype);
+        && $stable(o_ethertype)
+        && $stable(o_frame_size);
     endproperty
 
 
@@ -431,6 +453,26 @@ module ethernet_dispatch_TB;
     assert property (p_source_stable_when_stalled)
     else begin
         tb_error("TB AXIS source changed data while DUT stalled it");
+    end
+
+
+    //
+    // Frame-size metadata source must also obey ready/valid semantics.
+    //
+    property p_frame_meta_stable_when_stalled;
+        @(posedge i_clk)
+        disable iff (!i_n_reset)
+
+        i_frame_meta_valid && !o_frame_meta_ready
+        |=>
+        i_frame_meta_valid
+        && $stable(i_frame_size);
+    endproperty
+
+
+    assert property (p_frame_meta_stable_when_stalled)
+    else begin
+        tb_error("TB frame metadata changed while DUT stalled it");
     end
 
 
@@ -527,9 +569,10 @@ module ethernet_dispatch_TB;
 
         expected_meta_t meta;
 
-        meta.dst   = dst;
-        meta.src   = src;
-        meta.etype = etype;
+        meta.dst        = dst;
+        meta.src        = src;
+        meta.etype      = etype;
+        meta.frame_size = 11'(payload.size());
 
         expected_meta_q.push_back(meta);
 
@@ -632,6 +675,34 @@ module ethernet_dispatch_TB;
 
 
     // ================================================================
+    // Send frame-size metadata from rx_frame_buffer
+    //
+    // The real rx_frame_buffer publishes the complete Ethernet frame
+    // size before presenting byte 0 on AXIS. Hold valid until accepted.
+    // ================================================================
+
+    task automatic send_frame_metadata(
+        input int frame_size
+    );
+
+        @(negedge i_clk);
+
+        i_frame_size       <= 11'(frame_size);
+        i_frame_meta_valid <= 1'b1;
+
+        do begin
+            @(posedge i_clk);
+        end
+        while (!o_frame_meta_ready);
+
+        @(negedge i_clk);
+
+        i_frame_meta_valid <= 1'b0;
+
+    endtask
+
+
+    // ================================================================
     // Send complete Ethernet frame
     // ================================================================
 
@@ -648,6 +719,8 @@ module ethernet_dispatch_TB;
             last_q.push_back(
                 i == frame.size()-1
             );
+
+        send_frame_metadata(frame.size());
 
         send_sequence(
             frame,
@@ -685,7 +758,7 @@ module ethernet_dispatch_TB;
 
 
     // ================================================================
-    // Send two frames with absolutely no TVALID gap
+    // Send two frames back-to-back using the metadata-before-data contract
     // ================================================================
 
     task automatic send_two_frames_contiguous(
@@ -693,37 +766,26 @@ module ethernet_dispatch_TB;
         input byte_t frame2[$]
     );
 
-        byte_t data_q[$];
-        bit    last_q[$];
+        bit last1[$];
+        bit last2[$];
 
-        data_q.delete();
-        last_q.delete();
+        last1.delete();
+        last2.delete();
 
-        for (int i = 0; i < frame1.size(); i++) begin
+        for (int i = 0; i < frame1.size(); i++)
+            last1.push_back(i == frame1.size()-1);
 
-            data_q.push_back(frame1[i]);
+        for (int i = 0; i < frame2.size(); i++)
+            last2.push_back(i == frame2.size()-1);
 
-            last_q.push_back(
-                i == frame1.size()-1
-            );
+        // Frame 1 metadata, then frame 1 data.
+        send_frame_metadata(frame1.size());
+        send_sequence(frame1, last1, 0);
 
-        end
-
-        for (int i = 0; i < frame2.size(); i++) begin
-
-            data_q.push_back(frame2[i]);
-
-            last_q.push_back(
-                i == frame2.size()-1
-            );
-
-        end
-
-        send_sequence(
-            data_q,
-            last_q,
-            0
-        );
+        // The updated interface requires metadata for frame 2 before its
+        // byte 0 can be accepted. This models rx_frame_buffer behavior.
+        send_frame_metadata(frame2.size());
+        send_sequence(frame2, last2, 0);
 
     endtask
 
@@ -804,9 +866,11 @@ module ethernet_dispatch_TB;
 
         @(negedge i_clk);
 
-        i_n_reset     <= 1'b0;
-        s_axis_tvalid <= 1'b0;
-        s_axis_tlast  <= 1'b0;
+        i_n_reset          <= 1'b0;
+        s_axis_tvalid      <= 1'b0;
+        s_axis_tlast       <= 1'b0;
+        i_frame_meta_valid <= 1'b0;
+        i_frame_size       <= '0;
 
         //
         // Requirement says outputs cease upon reset assertion.
@@ -836,8 +900,11 @@ module ethernet_dispatch_TB;
         if (o_src_mac !== 48'b0)
             tb_error("o_src_mac did not clear during reset");
 
-        if (o_ethertype !== '0)
-            tb_error("o_ethertype did not clear during reset");
+        if (o_ethertype !== ETH_INVALID)
+            tb_error("o_ethertype did not reset to ETH_INVALID");
+
+        if (o_frame_size !== '0)
+            tb_error("o_frame_size did not clear during reset");
 
         @(negedge i_clk);
 
@@ -1122,7 +1189,7 @@ module ethernet_dispatch_TB;
         byte_t frame1[$];
         byte_t frame2[$];
 
-        start_test("Back-to-back IPv4 and ARP with no TVALID gap");
+        start_test("Back-to-back IPv4 and ARP with per-frame metadata");
 
         clear_scoreboard();
 
@@ -1284,11 +1351,17 @@ module ethernet_dispatch_TB;
 
         expect_no_outputs = 1'b1;
 
+        send_frame_metadata(frame.size());
         send_no_last(header);
 
-        //
-        // DUT should now be in DROP.
-        //
+        // The header completion puts the DUT in DISP_OUTPUT.
+        // Give it one clock to classify the EtherType and enter DISP_DROP.
+        @(posedge i_clk);
+        #1;
+
+        if (s_axis_tready !== 1'b1)
+            tb_error("DUT did not enter DISP_DROP after unsupported EtherType");
+
         expect_drop_ready = 1'b1;
 
         for (int i = 14; i < frame.size(); i++) begin
@@ -1368,6 +1441,8 @@ module ethernet_dispatch_TB;
 
             expect_no_outputs = 1'b1;
 
+            send_frame_metadata(runt.size());
+
             send_sequence(
                 runt,
                 runt_last,
@@ -1410,6 +1485,8 @@ module ethernet_dispatch_TB;
         last_q.push_back(1'b1);
 
         expect_no_outputs = 1'b1;
+
+        send_frame_metadata(data_q.size());
 
         send_sequence(
             data_q,
@@ -1841,6 +1918,7 @@ module ethernet_dispatch_TB;
         for (int i = 0; i < 5; i++)
             first_part.push_back(frame[i]);
 
+        send_frame_metadata(frame.size());
         send_no_last(first_part);
 
         //
@@ -1992,7 +2070,7 @@ module ethernet_dispatch_TB;
         m_axis_tready = 1'b1;
 
         //
-        // No TVALID bubble between bad packet TLAST and next packet.
+        // No arbitrary idle delay is inserted; frame 2 begins as soon as its metadata is accepted.
         //
         send_two_frames_contiguous(
             bad_frame,
@@ -2039,6 +2117,7 @@ module ethernet_dispatch_TB;
         for (int i = 0; i < 5; i++)
             prefix.push_back(frame[i]);
 
+        send_frame_metadata(frame.size());
         send_no_last(prefix);
 
         apply_reset();
@@ -2091,6 +2170,7 @@ module ethernet_dispatch_TB;
         i_meta_ready  = 1'b0;
         m_axis_tready = 1'b1;
 
+        send_frame_metadata(frame.size());
         send_no_last(header);
 
         wait_for_meta_valid();
@@ -2149,6 +2229,7 @@ module ethernet_dispatch_TB;
         i_meta_ready  = 1'b1;
         m_axis_tready = 1'b1;
 
+        send_frame_metadata(frame.size());
         send_no_last(header);
 
         //
@@ -2247,6 +2328,7 @@ module ethernet_dispatch_TB;
         for (int i = 0; i < 15; i++)
             prefix.push_back(frame[i]);
 
+        send_frame_metadata(frame.size());
         send_no_last(prefix);
 
         apply_reset();
@@ -2510,6 +2592,9 @@ module ethernet_dispatch_TB;
         s_axis_tdata  = 8'b0;
         s_axis_tvalid = 1'b0;
         s_axis_tlast  = 1'b0;
+
+        i_frame_meta_valid = 1'b0;
+        i_frame_size       = '0;
 
         m_axis_tready = 1'b0;
         i_meta_ready  = 1'b0;

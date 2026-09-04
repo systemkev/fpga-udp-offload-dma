@@ -20,6 +20,11 @@ module rx_frame_buffer (
     input  logic       m_axis_tready,
     output logic       m_axis_tlast,
 
+    // Metadata handshaking 
+    input  logic        i_meta_ready,
+    output logic        o_meta_valid,
+    output logic [10:0] o_frame_size,   
+
     // status
     output logic       o_buf_ovf
 );
@@ -43,6 +48,7 @@ module rx_frame_buffer (
 
     typedef enum logic [2:0] {
         RD_READY,
+        RD_META,
         RD_READ,
         RD_WAIT,
         RD_CDC_ACK
@@ -187,33 +193,58 @@ module rx_frame_buffer (
             rd_ptr        <= '0;
             rd_buf_0_done <= 1'b0;
             rd_buf_1_done <= 1'b0;
+            o_meta_valid  <= 1'b0;
+            o_frame_size  <= '0;
         end else begin 
             
             case (rd_state)
 
-                RD_READY : begin 
-                    rd_ptr       <= 0;
-                    m_axis_tlast <= 1'b0;
-                    if (rd_buf_0_full) begin 
-                        rd_buf_sel    <= 1'b0;
-                        rd_state      <= RD_READ;
-                        rd_ptr_size   <= wr_ptr_reg_0;
-                        m_axis_tlast  <= (wr_ptr_reg_0 == 1); // ethernet frame should never have a size of 1
-                                                              // still adding this here for completeness
+                RD_READY : begin
+                    rd_ptr        <= '0;
+                    m_axis_tvalid <= 1'b0;
+                    m_axis_tlast  <= 1'b0;
+                    o_meta_valid  <= 1'b0;
+
+                    if (rd_buf_0_full) begin
+                        rd_buf_sel   <= 1'b0;
+                        rd_ptr_size  <= wr_ptr_reg_0;
+
+                        // publish metadata
+                        o_frame_size <= wr_ptr_reg_0;
+                        o_meta_valid <= 1'b1;
+
+                        rd_state <= RD_META;
+
+                    end else if (rd_buf_1_full) begin
+                        rd_buf_sel   <= 1'b1;
+                        rd_ptr_size  <= wr_ptr_reg_1;
+
+                        // publish metadata
+                        o_frame_size <= wr_ptr_reg_1;
+                        o_meta_valid <= 1'b1;
+
+                        rd_state <= RD_META;
+                    end
+                end
+
+                RD_META : begin
+                    // Hold o_meta_valid and o_frame_size stable until accepted
+                    if (o_meta_valid && i_meta_ready) begin
+                        o_meta_valid <= 1'b0;
+
+                        // Now begin streaming byte 0
+                        if (!rd_buf_sel) begin
+                            m_axis_tdata <= ping_pong_buf_0[0];
+                        end else begin
+                            m_axis_tdata <= ping_pong_buf_1[0];
+                        end
 
                         m_axis_tvalid <= 1'b1;
-                        m_axis_tdata  <= ping_pong_buf_0[0];
-                    end else if (rd_buf_1_full) begin 
-                        rd_buf_sel    <= 1'b1;
-                        rd_state      <= RD_READ;
-                        rd_ptr_size   <= wr_ptr_reg_1;
-                        m_axis_tlast  <= (wr_ptr_reg_1 == 1); // ethernet frame should never have a size of 1
-                                                              // still adding this here for completeness
-                        
-                        m_axis_tvalid <= 1'b1;
-                        m_axis_tdata  <= ping_pong_buf_1[0];
-                    end 
-                end 
+                        m_axis_tlast  <= (rd_ptr_size == 1);
+
+                        rd_state <= RD_READ;
+                    end
+                end
 
                 RD_READ : begin 
                     if (m_axis_tvalid && m_axis_tready) begin 

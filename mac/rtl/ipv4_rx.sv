@@ -14,6 +14,7 @@ module ipv4_rx (
     // Ethernet metadata carried with this packet
     input  logic [47:0] i_src_mac,
     input  logic [47:0] i_dst_mac,
+    input  logic [10:0] i_frame_size,
 
     // AXIS8 IP payload output
     output logic [7:0] m_axis_tdata,
@@ -126,19 +127,32 @@ module ipv4_rx (
                                 meta.total_len[15:8] <= s_axis_tdata;
                             end 
 
-                            5'd3 : begin 
+                            5'd3 : begin
                                 meta.total_len[7:0] <= s_axis_tdata;
 
-                                // check that total length >= header size
-                                // ihl * 4 = shift left by 2
-                                if ({meta.total_len[15:8], s_axis_tdata} < {meta.ihl, 2'b0}) begin 
-                                    state <= ST_DROP;
+                                // i_frame_size is the complete Ethernet frame length
+                                // excluding FCS and the 14-byte Ethernet header.
+                                //
+                                // Therefore: available IPv4 bytes = i_frame_size 
+                                //
+                                // IPv4 total_len may be LESS than the available bytes because
+                                // Ethernet padding can exist after the IP packet.
 
-                                    if (s_axis_tlast) begin 
-                                        state <= ST_IDLE;
-                                    end 
-                                end 
-                            end 
+                                if ({meta.total_len[15:8], s_axis_tdata} < {meta.ihl, 2'b0}) begin
+                                    // IPv4 total length is smaller than its own header.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+
+                                end else if (i_frame_size < 11'd14) begin
+                                    // Defensive check: an Ethernet frame reaching here should
+                                    // always contain at least the Ethernet header.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+
+                                end else if ({meta.total_len[15:8], s_axis_tdata} > (i_frame_size)) begin
+                                    // IPv4 header claims more bytes than actually exist
+                                    // in the containing Ethernet frame.
+                                    state <= s_axis_tlast ? ST_IDLE : ST_DROP;
+                                end
+                            end
 
                             // no checks, just metadata
                             5'd4 : begin 
