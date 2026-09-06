@@ -21,6 +21,12 @@ package common_pkg;
     // UDP header
     parameter logic [3:0] UDP_HEAD_NUM_BYTES = 4'd8;
 
+    // S2MM constants
+    parameter int FIFO_ENTRY_WIDTH = 37;
+    parameter int FIFO_DEPTH = 16;
+    parameter int MAX_BURST = 16;
+    parameter logic [12:0] FOUR_KB_BOUNDARY = 13'h1000;
+
     typedef struct packed {
         // Carried from Ethernet layer
         logic [47:0] src_mac;
